@@ -1,318 +1,258 @@
-#!/usr/bin/env python3
-"""
-ERA SNIPER - Discord Bot
-Slash-command version of the username generator/checker.
-
-Requires:
-  pip install discord.py requests
-  (optional, only for /check platform:bedrock)
-  pip install xbox-webapi httpx
-
-Setup:
-  1. Go to https://discord.com/developers/applications, create a
-     "New Application", then under "Bot" click "Add Bot" and copy the
-     token (Reset Token if needed).
-  2. Under "OAuth2 > URL Generator", check scopes "bot" and
-     "applications.commands", give it permission "Send Messages", then
-     open the generated URL to invite it to your server.
-  3. Set the token as an environment variable (don't hardcode it):
-       Windows (PowerShell):  $env:DISCORD_BOT_TOKEN="your_token_here"
-       macOS/Linux:           export DISCORD_BOT_TOKEN="your_token_here"
-  4. (Optional, for Bedrock/Xbox checking) run era_sniper_bedrock.py
-     --setup once on this same machine so a tokens.json file exists next
-     to this bot script — the bot reuses it. All Discord users who run
-     /check platform:bedrock will be checking under that one Microsoft
-     account. That's fine for read-only availability checks.
-  5. Run:  python era_sniper_discord_bot.py
-
-Commands:
-  /generate length count charset exhaustive
-  /check    length count charset platform
-
-I could not test this bot live in my build environment (no network
-access there, and no Discord bot token), so double-check the first run
-and let me know if anything errors out.
-"""
-
-import asyncio
-import io
-import itertools
-import os
-import random
-import string
-import time
-from pathlib import Path
-
 import discord
+from discord.ext import commands, tasks
 from discord import app_commands
-from discord.ext import commands
+import os
+import itertools
+import string
+import aiohttp
+import asyncio
 
-try:
-    import requests
-except ImportError:
-    requests = None
-
-# Optional Bedrock/Xbox support - only needed if you use platform:bedrock
-try:
-    from httpx import HTTPStatusError
-    from xbox.webapi.api.client import XboxLiveClient
-    from xbox.webapi.authentication.manager import AuthenticationManager
-    from xbox.webapi.authentication.models import OAuth2TokenResponse
-    from xbox.webapi.common.signed_session import SignedSession
-    BEDROCK_AVAILABLE = True
-except ImportError:
-    BEDROCK_AVAILABLE = False
-
-LETTERS = string.ascii_lowercase
-ALNUM = string.ascii_lowercase + string.digits
-
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-XBOX_CLIENT_ID = os.environ.get("XBOX_CLIENT_ID")
-XBOX_CLIENT_SECRET = os.environ.get("XBOX_CLIENT_SECRET")
-TOKENS_FILE = Path("tokens.json")
-
-CHECK_DELAY_SECONDS = 3          # ~10 names every 30 seconds, same pace as the CLI
-PROGRESS_UPDATE_EVERY = 5        # edit the Discord message every N checks
-
-
-# ---------------- Generation (never starts with a digit) ----------------
-
-def gen_random(length, charset, count):
-    seen = set()
-    names = []
-    guard = 0
-    while len(names) < count and guard < count * 50:
-        first = random.choice(LETTERS)
-        rest = "".join(random.choice(charset) for _ in range(length - 1))
-        n = first + rest
-        if n not in seen:
-            seen.add(n)
-            names.append(n)
-        guard += 1
-    return names
-
-
-def gen_exhaustive(length, charset):
-    for first in LETTERS:
-        for rest in itertools.product(charset, repeat=length - 1):
-            yield first + "".join(rest)
-
-
-# ---------------- Java (Mojang) checking ----------------
-
-def check_name_java_sync(name, session):
-    if requests is None:
-        return "unknown"
-    url = f"https://api.mojang.com/users/profiles/minecraft/{name}"
-    try:
-        r = session.get(url, timeout=5)
-        if r.status_code in (204, 404):
-            return "free"
-        if r.status_code == 200:
-            return "taken"
-        return "unknown"
-    except Exception:
-        return "unknown"
-
-
-async def check_name_java(name, session):
-    # requests is blocking; run it off the event loop so the bot stays responsive
-    return await asyncio.to_thread(check_name_java_sync, name, session)
-
-
-# ---------------- Bedrock (Xbox Live) checking ----------------
-
-_xbl_client = None
-_xbl_session = None
-
-
-async def get_xbl_client():
-    global _xbl_client, _xbl_session
-    if _xbl_client is not None:
-        return _xbl_client
-    if not BEDROCK_AVAILABLE:
-        raise RuntimeError("xbox-webapi isn't installed on this bot host.")
-    if not XBOX_CLIENT_ID or not XBOX_CLIENT_SECRET:
-        raise RuntimeError("XBOX_CLIENT_ID / XBOX_CLIENT_SECRET env vars aren't set.")
-    if not TOKENS_FILE.exists():
-        raise RuntimeError(
-            "No tokens.json found. Run era_sniper_bedrock.py --setup once on this host first."
-        )
-    session = SignedSession()
-    auth_mgr = AuthenticationManager(session, XBOX_CLIENT_ID, XBOX_CLIENT_SECRET, "")
-    auth_mgr.oauth = OAuth2TokenResponse.model_validate_json(TOKENS_FILE.read_text())
-    await auth_mgr.refresh_tokens()
-    TOKENS_FILE.write_text(auth_mgr.oauth.model_dump_json())
-    auth_mgr.user_token = await auth_mgr.request_user_token()
-    auth_mgr.xsts_token = await auth_mgr.request_xsts_token()
-    _xbl_client = XboxLiveClient(auth_mgr)
-    _xbl_session = session
-    return _xbl_client
-
-
-async def check_gamertag_bedrock(xbl_client, name):
-    try:
-        await xbl_client.account.claim_gamertag(xbl_client.xuid, name)
-        return "free"
-    except HTTPStatusError as e:
-        code = e.response.status_code
-        if code == 409:
-            return "taken"
-        if code == 429:
-            return "rate_limited"
-        if code == 401:
-            return "auth_error"
-        return "unknown"
-    except Exception:
-        return "unknown"
-
-
-# ---------------- Discord bot ----------------
-
+# Initialize bot
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Global state
+checking_active = False
+checking_mode = None
+checking_count = 0
+checked_count = 0
+found_names = []
+
+# Webhook URL (set via environment variable)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+
+class ModeSelect(discord.ui.Select):
+    """Dropdown to select checking mode (3c, 3l, 4c, 4l)"""
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="3c (3 chars: letters + numbers)", value="3c"),
+            discord.SelectOption(label="3l (3 letters only)", value="3l"),
+            discord.SelectOption(label="4c (4 chars: letters + numbers)", value="4c"),
+            discord.SelectOption(label="4l (4 letters only)", value="4l"),
+        ]
+        super().__init__(placeholder="Select a mode...", options=options)
+    
+    async def callback(self, interaction: discord.Interaction):
+        mode = self.values[0]
+        # Show modal to get username count
+        await interaction.response.send_modal(CountModal(mode, self.view.platform))
+
+class ModeView(discord.ui.View):
+    def __init__(self, platform: str):
+        super().__init__()
+        self.platform = platform
+        self.add_item(ModeSelect())
+
+class CountModal(discord.ui.Modal, title="Username Count"):
+    """Modal to input how many usernames to test"""
+    count_input = discord.ui.TextInput(
+        label="How many usernames to test?",
+        placeholder="Enter a number (e.g., 100)",
+        required=True,
+        min_length=1,
+        max_length=10
+    )
+    
+    def __init__(self, mode: str, platform: str):
+        super().__init__()
+        self.mode = mode
+        self.platform = platform
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        global checking_active, checking_mode, checking_count, checked_count, found_names
+        
+        try:
+            count = int(self.count_input.value)
+            if count <= 0:
+                await interaction.response.send_message("❌ Please enter a positive number!", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("❌ Please enter a valid number!", ephemeral=True)
+            return
+        
+        checking_active = True
+        checking_mode = (self.mode, self.platform)
+        checking_count = count
+        checked_count = 0
+        found_names = []
+        
+        await interaction.response.send_message(
+            f"✅ Started checking **{count}** usernames on **{self.platform.upper()}** (Mode: **{self.mode}**)\nUse `/stop` to cancel.",
+            ephemeral=True
+        )
+        
+        # Start the checking task
+        bot.loop.create_task(check_usernames(self.mode, self.platform, count))
+
+async def generate_usernames(mode: str, count: int):
+    """Generate usernames based on mode"""
+    if mode == "3c":
+        # 3 characters: letters + numbers, no leading numbers for Xbox
+        chars = string.ascii_lowercase + string.digits
+        names = set()
+        for combo in itertools.combinations_with_replacement(chars, 3):
+            names.add(''.join(combo))
+        return list(names)[:count]
+    
+    elif mode == "3l":
+        # 3 letters only
+        chars = string.ascii_lowercase
+        names = set()
+        for combo in itertools.combinations_with_replacement(chars, 3):
+            names.add(''.join(combo))
+        return list(names)[:count]
+    
+    elif mode == "4c":
+        # 4 characters: letters + numbers
+        chars = string.ascii_lowercase + string.digits
+        names = set()
+        for combo in itertools.combinations_with_replacement(chars, 4):
+            names.add(''.join(combo))
+        return list(names)[:count]
+    
+    elif mode == "4l":
+        # 4 letters only
+        chars = string.ascii_lowercase
+        names = set()
+        for combo in itertools.combinations_with_replacement(chars, 4):
+            names.add(''.join(combo))
+        return list(names)[:count]
+    
+    return []
+
+async def check_xbox_username(username: str) -> bool:
+    """Check if username is available on Xbox"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Xbox Live username check
+            url = f"https://xboxgamertag.com/search/{username}"
+            async with session.get(url, timeout=5) as resp:
+                return resp.status == 404  # 404 means available
+    except:
+        return False
+
+async def check_discord_username(username: str) -> bool:
+    """Check if username is available on Discord"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # This is a simplified check - Discord doesn't have a public API for this
+            # You may need to adjust based on your actual checking method
+            url = f"https://discord.com/api/v10/users/search?q={username}"
+            async with session.get(url, timeout=5) as resp:
+                return resp.status == 404  # Simplified
+    except:
+        return False
+
+async def send_webhook_message(username: str, platform: str):
+    """Send embed message via webhook"""
+    if not WEBHOOK_URL:
+        print(f"⚠️ Webhook URL not set! Found: {username} on {platform}")
+        return
+    
+    embed = discord.Embed(
+        title=f"✅ Available!",
+        description=f"**{username}** is available on **{platform.upper()}**!",
+        color=discord.Color.green()
+    )
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = {"embeds": [embed.to_dict()]}
+            async with session.post(WEBHOOK_URL, json=data, timeout=5) as resp:
+                if resp.status == 204:
+                    print(f"✅ Webhook sent: {username} on {platform}")
+    except Exception as e:
+        print(f"❌ Webhook error: {e}")
+
+async def check_usernames(mode: str, platform: str, count: int):
+    """Main checking loop"""
+    global checking_active, checked_count, found_names
+    
+    usernames = await generate_usernames(mode, count)
+    
+    for username in usernames:
+        if not checking_active:
+            break
+        
+        if platform == "xbox":
+            available = await check_xbox_username(username)
+        else:  # discord
+            available = await check_discord_username(username)
+        
+        checked_count += 1
+        
+        if available:
+            found_names.append(username)
+            await send_webhook_message(username, platform)
+            print(f"✅ Found: {username} on {platform}")
+        
+        # Small delay to avoid rate limiting
+        await asyncio.sleep(0.5)
+    
+    checking_active = False
+    print(f"✅ Checking completed! Found {len(found_names)} available usernames.")
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user} — slash commands synced.")
+    print(f"✅ Bot logged in as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"❌ Failed to sync commands: {e}")
 
-
-@bot.tree.command(name="generate", description="Generate a list of usernames (never starting with a digit)")
-@app_commands.describe(
-    length="Username length (default 4)",
-    count="How many to generate (default 30, max 500)",
-    charset="letters or letters+digits",
-    exhaustive="Generate ALL combinations instead of random ones (careful, can be huge)",
-)
-@app_commands.choices(charset=[
-    app_commands.Choice(name="letters only", value="letters"),
-    app_commands.Choice(name="letters + digits", value="alnum"),
-])
-async def generate(
-    interaction: discord.Interaction,
-    length: int = 4,
-    count: int = 30,
-    charset: app_commands.Choice[str] = None,
-    exhaustive: bool = False,
-):
-    await interaction.response.defer(thinking=True)
-    cs = ALNUM if (charset and charset.value == "alnum") else LETTERS
-    count = max(1, min(count, 500))
-
-    if exhaustive:
-        total = len(LETTERS) * (len(cs) ** (length - 1))
-        if total > 50000:
-            await interaction.followup.send(
-                f"Refused: exhaustive generation would produce {total:,} combinations, "
-                f"too many for Discord. Try a shorter length or disable exhaustive."
-            )
-            return
-        names = list(gen_exhaustive(length, cs))
-    else:
-        names = gen_random(length, cs, count)
-
-    text = "\n".join(names)
-    if len(text) < 1900:
-        await interaction.followup.send(f"Generated **{len(names)}** usernames:\n```\n{text}\n```")
-    else:
-        file = discord.File(io.BytesIO(text.encode()), filename="usernames.txt")
-        await interaction.followup.send(f"Generated **{len(names)}** usernames:", file=file)
-
-
-@bot.tree.command(name="check", description="Auto-generate and check usernames, shows only the available ones")
-@app_commands.describe(
-    length="Username length (default 4)",
-    count="How many to test (default 20, max 100)",
-    charset="letters or letters+digits",
-    platform="java (Minecraft Java, default) or bedrock (Xbox Live)",
-)
-@app_commands.choices(
-    charset=[
-        app_commands.Choice(name="letters only", value="letters"),
-        app_commands.Choice(name="letters + digits", value="alnum"),
-    ],
-    platform=[
-        app_commands.Choice(name="Minecraft Java (Mojang API)", value="java"),
-        app_commands.Choice(name="Xbox Live / Bedrock", value="bedrock"),
-    ],
-)
-async def check(
-    interaction: discord.Interaction,
-    length: int = 4,
-    count: int = 20,
-    charset: app_commands.Choice[str] = None,
-    platform: app_commands.Choice[str] = None,
-):
-    await interaction.response.defer(thinking=True)
-    cs = ALNUM if (charset and charset.value == "alnum") else LETTERS
-    plat = platform.value if platform else "java"
-    count = max(1, min(count, 100))
-
-    names = gen_random(length, cs, count)
-
-    # ~10 checks per 30s -> this can take a while for large counts; warn the user
-    est_seconds = len(names) * CHECK_DELAY_SECONDS
-    progress_msg = await interaction.followup.send(
-        f"Checking **{len(names)}** names on **{plat}**... "
-        f"(~{est_seconds}s at this rate limit, {CHECK_DELAY_SECONDS}s between checks)"
+@bot.tree.command(name="start", description="Start checking usernames")
+@app_commands.describe(platform="Choose Xbox or Discord")
+async def start_command(interaction: discord.Interaction, platform: str):
+    """Start checking command"""
+    global checking_active
+    
+    if checking_active:
+        await interaction.response.send_message("⚠️ Already checking! Use `/stop` first.", ephemeral=True)
+        return
+    
+    if platform.lower() not in ["xbox", "discord"]:
+        await interaction.response.send_message("❌ Platform must be 'xbox' or 'discord'", ephemeral=True)
+        return
+    
+    view = ModeView(platform.lower())
+    await interaction.response.send_message(
+        f"🎮 Select a mode for **{platform.upper()}**:",
+        view=view,
+        ephemeral=True
     )
 
-    available = []
+@bot.tree.command(name="stop", description="Stop checking usernames")
+async def stop_command(interaction: discord.Interaction):
+    """Stop checking command"""
+    global checking_active
+    
+    if not checking_active:
+        await interaction.response.send_message("⚠️ No checking in progress!", ephemeral=True)
+        return
+    
+    checking_active = False
+    await interaction.response.send_message(
+        f"🛑 Stopped checking! Found {len(found_names)} available usernames.",
+        ephemeral=True
+    )
 
-    if plat == "bedrock":
-        try:
-            xbl_client = await get_xbl_client()
-        except RuntimeError as e:
-            await progress_msg.edit(content=f"Bedrock check unavailable: {e}")
-            return
+@bot.tree.command(name="status", description="Check current status")
+async def status_command(interaction: discord.Interaction):
+    """Status command"""
+    global checking_active, checked_count, checking_count, found_names
+    
+    if not checking_active:
+        await interaction.response.send_message("⏸️ No checking in progress.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title="📊 Checking Status", color=discord.Color.blue())
+    embed.add_field(name="Progress", value=f"{checked_count}/{checking_count}", inline=False)
+    embed.add_field(name="Found", value=f"{len(found_names)} available", inline=False)
+    embed.add_field(name="Mode", value=f"{checking_mode[0]} ({checking_mode[1]})", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        for i, name in enumerate(names, 1):
-            status = await check_gamertag_bedrock(xbl_client, name)
-            if status == "rate_limited":
-                await asyncio.sleep(5)
-                status = await check_gamertag_bedrock(xbl_client, name)
-            if status == "free":
-                available.append(name)
-            elif status == "auth_error":
-                await progress_msg.edit(content="Xbox auth expired — the bot host needs to re-run --setup.")
-                return
-            if i % PROGRESS_UPDATE_EVERY == 0 or i == len(names):
-                await progress_msg.edit(
-                    content=f"Checking **{len(names)}** names on **{plat}**... {i}/{len(names)} "
-                            f"({len(available)} free so far)"
-                )
-            await asyncio.sleep(CHECK_DELAY_SECONDS)
-    else:
-        if requests is None:
-            await progress_msg.edit(content="The 'requests' module isn't installed on the bot host.")
-            return
-        session = requests.Session()
-        for i, name in enumerate(names, 1):
-            status = await check_name_java(name, session)
-            if status == "free":
-                available.append(name)
-            if i % PROGRESS_UPDATE_EVERY == 0 or i == len(names):
-                await progress_msg.edit(
-                    content=f"Checking **{len(names)}** names on **{plat}**... {i}/{len(names)} "
-                            f"({len(available)} free so far)"
-                )
-            await asyncio.sleep(CHECK_DELAY_SECONDS)
-
-    if available:
-        result_text = "\n".join(available)
-        await progress_msg.edit(
-            content=f"Done. **{len(available)}/{len(names)}** available:\n```\n{result_text}\n```"
-        )
-    else:
-        await progress_msg.edit(content=f"Done. No available usernames found out of {len(names)}.")
-
-
-if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit(
-            "Missing DISCORD_BOT_TOKEN environment variable. "
-            "Set it before running this script (see the setup notes at the top of this file)."
-        )
-    bot.run(TOKEN)
+# Run the bot
+bot.run(os.getenv("DISCORD_BOT_TOKEN"))
