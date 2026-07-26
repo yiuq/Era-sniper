@@ -1,0 +1,1 @@
+worker: python era_sniper_discord_bot.py

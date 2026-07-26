@@ -1,0 +1,4 @@
+discord.py>=2.3
+requests>=2.31
+xbox-webapi>=2.1
+httpx>=0.25
